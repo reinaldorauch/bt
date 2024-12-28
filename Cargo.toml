@@ -1,15 +1,17 @@
+cargo-features = ["edition2024"]
+
 [package]
 name = "bt"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
+reqwest = { version = "0.12.9" }
 bendy = "0.3.3"
 chrono = "0.4.38"
 clap = { version = "4.5.23", features = ["derive"] }
 hex = "0.4.3"
 rand = "0.8.5"
-reqwest = "0.12.9"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 sha1-checked = "0.10.0"
 tokio = { version = "1", features = ["full"] }

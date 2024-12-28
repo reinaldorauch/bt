@@ -1,275 +1,45 @@
-use bendy::decoding::{FromBencode, Object, ResultExt};
-use reqwest::{Client, StatusCode};
-use std::{fmt::Display, time::Duration};
+use bendy::decoding::FromBencode;
+use reqwest::{Client, StatusCode, Url};
+use std::{sync::Arc, time::Duration};
+use tokio::{fs::File, sync::RwLock, task::JoinSet};
 
-use crate::bittorrent::PeerId;
-
-#[derive(Debug, PartialEq)]
-pub struct Peer {
-    pub id: Option<PeerId>,
-    pub ip: String,
-    pub port: usize,
-}
-
-impl Peer {
-    pub fn from_slice(b: &[u8]) -> Self {
-        let ip = b[0..=4]
-            .iter()
-            .map(|n| char::from(*n))
-            .intersperse('.')
-            .collect::<String>();
-
-        let mut buffer: [u8; 8] = [0; 8];
-
-        buffer.copy_from_slice(&b[5..]);
-
-        Peer {
-            id: None,
-            ip,
-            port: usize::from_be_bytes(buffer),
-        }
-    }
-}
-
-impl Display for Peer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(id) = &self.id {
-            write!(f, "    [{}] {}:{}", id, self.ip, self.port)
-        } else {
-            write!(f, "    [no id] {}:{}", self.ip, self.port)
-        }
-    }
-}
-
-#[test]
-fn test_peer_from_slice() {
-    let slice: [u8; 6] = [10, 0, 0, 1, 0x1a, 0xe1];
-
-    assert_eq!(
-        Peer {
-            id: None,
-            ip: "10.0.0.1".to_string(),
-            port: 6881
-        },
-        Peer::from_slice(&slice)
-    )
-}
-
-impl FromBencode for Peer {
-    const EXPECTED_RECURSION_DEPTH: usize = 1;
-
-    fn decode_bencode_object(object: Object) -> Result<Self, bendy::decoding::Error>
-    where
-        Self: Sized,
-    {
-        let mut decoder = object.try_into_dictionary()?;
-
-        let mut id = None;
-        let mut ip = None;
-        let mut port = None;
-
-        while let Some(pair) = decoder.next_pair()? {
-            match pair {
-                (b"id", val) => id = Some(PeerId::decode_bencode_object(val).context("id")?),
-                (b"ip", val) => ip = Some(String::decode_bencode_object(val).context("ip")?),
-                (b"port", val) => port = Some(usize::decode_bencode_object(val).context("port")?),
-                (f, _) => {
-                    let field = String::from_utf8(f.to_vec()).expect("malformed key value");
-                    return Err(bendy::decoding::Error::unexpected_field(field));
-                }
-            }
-        }
-
-        if let (None, None) = (ip.clone(), port) {
-            return Err(bendy::decoding::Error::missing_field("ip or port not set"));
-        }
-
-        Ok(Peer {
-            id,
-            ip: ip.expect("should have set ip"),
-            port: port.expect("should have set port"),
-        })
-    }
-}
-
-#[derive(Debug, PartialEq)]
-pub enum PeerInfoResult {
-    Error(String),
-    PeerInfo {
-        warning_message: Option<String>,
-        interval: u64,
-        min_interval: Option<u64>,
-        tracker_id: Option<String>,
-        complete: u64,
-        incomplete: u64,
-        peers: Vec<Peer>,
-    },
-}
-
-impl Display for PeerInfoResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use PeerInfoResult::*;
-
-        match self {
-            Error(s) => {
-                write!(f, "Error result: {}", s)
-            }
-            PeerInfo {
-                warning_message,
-                interval,
-                min_interval,
-                tracker_id,
-                complete,
-                incomplete,
-                peers,
-            } => {
-                write!(f, "Peer info result:\n")?;
-
-                if let Some(wm) = warning_message {
-                    write!(f, "Warning message: {}\n", wm)?;
-                }
-
-                if let Some(mi) = min_interval {
-                    write!(f, "min interval: {}\n", mi)?;
-                }
-
-                if let Some(ti) = tracker_id {
-                    write!(f, "tracker id: {}\n", ti)?
-                }
-
-                write!(
-                    f,
-                    "    interval: {}\n    complete: {}\n    incomplete: {}\n    peers: {}",
-                    interval,
-                    complete,
-                    incomplete,
-                    peers
-                        .iter()
-                        .map(|p| format!("    {}", p))
-                        .collect::<String>()
-                )
-            }
-        }
-    }
-}
-
-impl FromBencode for PeerInfoResult {
-    fn decode_bencode_object(object: Object) -> Result<Self, bendy::decoding::Error>
-    where
-        Self: Sized,
-    {
-        let mut decoder = object.try_into_dictionary()?;
-
-        let mut peers = None;
-        let mut tracker_id = None;
-        let mut complete = None;
-        let mut incomplete = None;
-        let mut interval = None;
-        let mut min_interval = None;
-        let mut warning_message = None;
-
-        while let Some(pair) = decoder.next_pair()? {
-            match pair {
-                (b"failure reason", val) => {
-                    let f = String::decode_bencode_object(val)?;
-                    return Ok(PeerInfoResult::Error(f));
-                }
-                (b"peers", val) => {
-                    let peer_bytes = val.try_into_bytes().context("peers")?;
-
-                    let mut peer_list: Vec<Peer> = vec![];
-                    if let Ok(mut list) = Object::Bytes(peer_bytes).try_into_list().context("peers")
-                    {
-                        while let Some(val) = list.next_object()? {
-                            peer_list.push(Peer::decode_bencode_object(val)?);
-                        }
-                    } else {
-                        for peer in peer_bytes.chunks(6) {
-                            peer_list.push(Peer::from_slice(peer));
-                        }
-                    }
-                    peers = Some(peer_list);
-                }
-                (b"tracker_id", val) => {
-                    tracker_id = Some(String::decode_bencode_object(val).context("tracker_id")?)
-                }
-                (b"complete", val) => {
-                    complete = Some(u64::decode_bencode_object(val).context("complete")?)
-                }
-                (b"incomplete", val) => {
-                    incomplete = Some(u64::decode_bencode_object(val).context("incomplete")?)
-                }
-                (b"interval", val) => {
-                    interval = Some(u64::decode_bencode_object(val).context("interval")?)
-                }
-                (b"min interval", val) => {
-                    min_interval = Some(u64::decode_bencode_object(val).context("min interval")?)
-                }
-                (b"warning message", val) => {
-                    warning_message =
-                        Some(String::decode_bencode_object(val).context("warning message")?)
-                }
-                (f, _) => {
-                    let field = String::from_utf8(f.to_vec()).expect("malformed key value");
-                    return Err(bendy::decoding::Error::unexpected_field(field));
-                }
-            }
-        }
-        if let (None, None, None) = (interval, complete, incomplete) {
-            if let None = interval {
-                return Err(bendy::decoding::Error::missing_field("interval"));
-            }
-
-            if let None = complete {
-                return Err(bendy::decoding::Error::missing_field("complete"));
-            }
-
-            if let None = incomplete {
-                return Err(bendy::decoding::Error::missing_field("incomplete"));
-            }
-        }
-
-        Ok(PeerInfoResult::PeerInfo {
-            warning_message,
-            interval: interval.expect("should contain interval"),
-            min_interval,
-            tracker_id,
-            complete: complete.expect("should contain complete"),
-            incomplete: incomplete.expect("should contain incomplete"),
-            peers: peers.expect("should contain peers"),
-        })
-    }
-}
-
-impl PeerInfoResult {
-    fn from_bytes(bytes: Vec<u8>) -> Result<Self, TorrentError> {
-        let obj = Object::Bytes(bytes.as_slice());
-
-        PeerInfoResult::decode_bencode_object(obj)
-            .map_err(|e| TorrentError::InvalidAnnounceResponse(e.to_string()))
-    }
-}
-
-#[derive(Debug)]
-pub enum TorrentError {
-    TrackerError(String),
-    InvalidAnnounceResponse(String),
-}
+use crate::bittorrent::{
+    AnnounceFailResult, DownloadProgress, PeerConnection, PeerInfoResult, TorrentError,
+};
 
 async fn announce(
     tracker: &String,
-    info_hash: crate::bittorrent::InfoHash,
-    peer_id: crate::bittorrent::PeerId,
+    info_hash: &crate::bittorrent::InfoHash,
+    peer_id: &crate::bittorrent::PeerId,
     port: usize,
+    progress_lock: &RwLock<DownloadProgress>,
 ) -> Result<PeerInfoResult, TorrentError> {
-    let qs = vec![
+    let mut qs = vec![
         ("info_hash", info_hash.to_string()),
         ("peer_id", peer_id.to_string()),
         ("port", port.to_string()),
     ];
-    let client = Client::new();
 
-    match client.get(tracker).query(&qs).send().await {
+    println!("{:?}", qs);
+
+    {
+        let progress = progress_lock.read().await;
+
+        if progress.bytes_downloaded > 0 {
+            qs.push(("downloaded", progress.bytes_downloaded.to_string()));
+            if progress.finished() {
+                qs.push(("event", "finished".to_string()));
+            }
+        } else {
+            qs.push(("event", "started".to_string()));
+        }
+        // dropping progress as then it can be released for other tasks
+    }
+
+    let client = Client::new();
+    let url = Url::parse(tracker).map_err(|e| TorrentError::InvalidTrackerUrl(e.to_string()))?;
+
+    match client.get(url.clone()).query(&qs).send().await {
         Ok(response) => {
             if response.status() != StatusCode::OK {
                 return Err(TorrentError::TrackerError("Error response".into()));
@@ -279,6 +49,10 @@ async fn announce(
                 .bytes()
                 .await
                 .map_err(|_| TorrentError::TrackerError("Unfinished response".into()))?;
+
+            if let Ok(result) = AnnounceFailResult::from_bencode(bytes.to_vec().as_slice()) {
+                return Err(TorrentError::TrackerError(result.to_string()));
+            }
 
             PeerInfoResult::from_bytes(bytes.to_vec())
         }
@@ -290,33 +64,122 @@ async fn announce(
 }
 
 pub async fn download_files(
-    trackers: Vec<String>,
+    maybe_trackers: Option<Vec<String>>,
+    maybe_web_seeds: Option<Vec<String>>,
     info_hash: crate::bittorrent::InfoHash,
     peer_id: crate::bittorrent::PeerId,
-    bt_listen_port: usize,
-) {
-    // Announcing
+    port: usize,
+) -> () {
+    let mut set = JoinSet::new();
 
-    tokio::task::spawn(async move {
-        loop {
-            for t in trackers.iter() {
-                let peer_info =
-                    announce(t, info_hash.clone(), peer_id.clone(), bt_listen_port).await;
+    let download_progress: Arc<RwLock<DownloadProgress>> =
+        Arc::new(RwLock::new(DownloadProgress::default()));
 
-                if let Err(e) = peer_info {
-                    use TorrentError::*;
-                    match e {
-                        InvalidAnnounceResponse(e) => {
-                            println!("Invalid announce response: {}", e)
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+
+    if let Some(trackers) = maybe_trackers {
+        println!(
+            "Trying to download from these trackers: \n{}",
+            trackers
+                .iter()
+                .map(|t| format!("    {}\n", t))
+                .collect::<String>()
+        );
+
+        for t in trackers {
+            let thread_info_hash = info_hash.clone();
+            let thread_peer_id = peer_id.clone();
+            let thread_download_progress = download_progress.clone();
+
+            let thread_tx = tx.clone();
+
+            set.spawn(async move {
+                let _ = thread_tx
+                    .send(format!("starting thread to announce the torrent"))
+                    .await;
+
+                let mut peers: Vec<PeerConnection> = Vec::new();
+                let announce_interval = Duration::from_secs(60);
+
+                loop {
+                    match announce(
+                        &t,
+                        &thread_info_hash,
+                        &thread_peer_id,
+                        port,
+                        &thread_download_progress,
+                    )
+                    .await
+                    {
+                        Ok(found_peers) => {
+                            let _ = thread_tx
+                                .send(format!("Got these peers {}", found_peers))
+                                .await;
+                            // peers.sort_by_key(|p| p.hostname.clone());
+                            // for p in found_peers.peers {
+                            //     let hostname = p.hostname();
+                            //     if let Err(_) =
+                            //         peers.binary_search_by_key(&hostname, |p| p.hostname.clone())
+                            //     {
+                            //         // Peer not found in current peer list, so make a connection to him
+                            //         match PeerConnection::connect(
+                            //             &hostname,
+                            //             &thread_info_hash,
+                            //             &thread_peer_id,
+                            //         )
+                            //         .await
+                            //         {
+                            //             Ok(c) => peers.push(c),
+                            //             Err(e) => {
+                            //                 println!("Could not connect to peer at {}: {}", hostname, e)
+                            //             }
+                            //         }
+                            //     }
+                            // }
                         }
-                        TrackerError(e) => println!("tracker error: {}", e),
-                    };
-                } else {
-                    println!("got peer info: {}", peer_info.unwrap());
-                }
-            }
+                        Err(e) => {
+                            let _ = thread_tx
+                                .send(format!("Error when announcing: {}", e))
+                                .await;
+                        }
+                    }
 
-            tokio::time::sleep(Duration::from_secs(60)).await;
+                    tokio::time::sleep(announce_interval).await;
+                }
+            });
         }
-    });
+    } else {
+        println!("this torrent doesnt have any defined tracker");
+    }
+
+    if let Some(web_seeds) = maybe_web_seeds {
+        println!(
+            "This torrent may download from these web seeds:\n{}",
+            web_seeds
+                .iter()
+                .map(|ws| format!("    {}\n", ws))
+                .collect::<String>()
+        );
+    } else {
+        println!("this torrent doesnt have webseeds");
+    }
+
+    while let Some(msg) = rx.recv().await {
+        println!("{}", msg);
+    }
+
+    set.join_all().await;
+
+    ()
+}
+
+pub async fn download_single_file(
+    pieces: Vec<String>,
+    maybe_trackers: Option<Vec<String>>,
+    maybe_web_seeds: Option<Vec<String>>,
+    file_handle: &mut File,
+) -> () {
+    let mut pieces_downloaded: Vec<bool> = Vec::with_capacity(pieces.len());
+
+    ()
 }

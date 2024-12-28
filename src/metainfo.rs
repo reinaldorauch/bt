@@ -1,6 +1,6 @@
 use std::{fmt::Display, vec};
 
-use bendy::decoding::{FromBencode, Object, ResultExt};
+use bendy::decoding::{FromBencode, ResultExt};
 
 use crate::bittorrent::InfoHash;
 
@@ -192,11 +192,7 @@ impl Display for Info {
                     pieces.len(),
                     length,
                     if let Some(v) = private {
-                        if *v {
-                            "yes"
-                        } else {
-                            "no"
-                        }
+                        if *v { "yes" } else { "no" }
                     } else {
                         "no"
                     }
@@ -216,11 +212,7 @@ impl Display for Info {
                     piece_length,
                     pieces.len(),
                     if let Some(v) = private {
-                        if *v {
-                            "yes"
-                        } else {
-                            "no"
-                        }
+                        if *v { "yes" } else { "no" }
                     } else {
                         "no"
                     },
@@ -233,7 +225,7 @@ impl Display for Info {
 
 #[derive(PartialEq, Debug)]
 pub struct MetaInfoFile {
-    pub announce: String,
+    pub announce: Option<String>,
     pub announce_list: Option<Vec<String>>,
     pub info: Info,
     pub created_by: Option<String>,
@@ -241,6 +233,7 @@ pub struct MetaInfoFile {
     pub comment: Option<String>,
     pub encoding: Option<String>,
     pub info_hash: InfoHash,
+    pub url_list: Option<Vec<String>>,
 }
 
 impl FromBencode for MetaInfoFile {
@@ -259,6 +252,7 @@ impl FromBencode for MetaInfoFile {
         let mut creation_date = None;
         let mut encoding = None;
         let mut info_hash = None;
+        let mut url_list = None;
 
         while let Some(pair) = dict.next_pair()? {
             match pair {
@@ -289,13 +283,9 @@ impl FromBencode for MetaInfoFile {
                         .map(Some)?
                 }
                 (b"info", val) => {
-                    let info_bytes = val.try_into_bytes().context("info")?;
-
-                    info_hash = Some(InfoHash::from_info_bytes(info_bytes));
-
-                    info = Info::decode_bencode_object(Object::Bytes(info_bytes))
-                        .context("single file info")
-                        .map(Some)?;
+                    let raw_val = val.try_into_dictionary().context("info")?.into_raw()?;
+                    info = Some(Info::from_bencode(raw_val).context("info")?);
+                    info_hash = Some(InfoHash::from_info_bytes(raw_val));
                 }
                 (b"comment", val) => {
                     comment = String::decode_bencode_object(val)
@@ -312,12 +302,20 @@ impl FromBencode for MetaInfoFile {
                         .context("encoding")
                         .map(Some)?
                 }
+                (b"url-list", val) => {
+                    let mut list_decoder = val.try_into_list().context("url-list")?;
+                    let mut url_vec: Vec<String> = vec![];
+                    while let Some(obj) = list_decoder.next_object()? {
+                        url_vec.push(String::decode_bencode_object(obj)?);
+                    }
+                    url_list = Some(url_vec);
+                }
                 (_, _) => {}
             }
         }
 
         Ok(MetaInfoFile {
-            announce: announce.expect("must have announce key"),
+            announce,
             announce_list,
             created_by,
             info: info.expect("Must have info key"),
@@ -325,6 +323,7 @@ impl FromBencode for MetaInfoFile {
             creation_date,
             encoding,
             info_hash: info_hash.expect("should have info hash"),
+            url_list,
         })
     }
 }

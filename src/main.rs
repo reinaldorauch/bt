@@ -5,14 +5,13 @@ mod download;
 mod metainfo;
 mod util;
 
-use std::fs;
-
 use bendy::decoding::FromBencode;
 use chrono::DateTime;
 use clap::Parser;
-use download::download_files;
+use download::{download_files, download_single_file};
 use metainfo::MetaInfoFile;
 use std::env;
+use tokio::fs::OpenOptions;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -34,12 +33,12 @@ async fn main() {
     let args = CliOptions::parse();
 
     // @TODO: persist data to disk
-    let mut peer_id = bittorrent::PeerId::new();
+    let peer_id = bittorrent::PeerId::new();
     let bt_listen_port = 6881usize;
 
     println!("File path: {:?}", args.torrent_file_path);
 
-    let torrent_file = fs::read(args.torrent_file_path).expect("Could not read torrent file.");
+    let torrent_file = std::fs::read(args.torrent_file_path).expect("Could not read torrent file.");
 
     let meta =
         MetaInfoFile::from_bencode(&torrent_file).expect("Error parsing bencode metainfo file");
@@ -89,7 +88,32 @@ async fn main() {
             private,
             length,
         } => {
-            unimplemented!();
+            let mut file_handle = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(&name)
+                .await
+                .expect(format!("could not open {} file", &name).as_str());
+
+            let trackers = if let Some(tr) = meta.announce {
+                let mut list = vec![tr];
+
+                if let Some(trlist) = meta.announce_list {
+                    list.append(&mut trlist.clone());
+                }
+
+                Some(list)
+            } else {
+                None
+            };
+
+            let web_seeds = if let Some(ws) = meta.url_list {
+                Some(ws)
+            } else {
+                None
+            };
+
+            download_single_file(pieces, trackers, web_seeds, &mut file_handle).await
         }
         metainfo::Info::MultiFileInfo {
             name,
@@ -106,19 +130,29 @@ async fn main() {
                 std::fs::create_dir(&torrent_dir_path).expect("could not create main dir");
             }
 
-            let mut trackers = vec![meta.announce];
-            if let Some(list) = meta.announce_list {
-                trackers.append(&mut list.clone());
+            let trackers: Option<Vec<String>>;
+
+            if let Some(announce) = meta.announce {
+                let mut ts = vec![announce];
+                if let Some(list) = meta.announce_list {
+                    ts.append(&mut list.clone());
+                }
+
+                trackers = Some(ts);
+            } else {
+                trackers = None;
+                println!("No trackers to download");
             }
 
-            println!(
-                "Trying to download from these trackers: \n{}",
-                trackers
-                    .iter()
-                    .map(|t| format!("    {}\n", t))
-                    .collect::<String>()
-            );
-            download_files(trackers, meta.info_hash, peer_id, bt_listen_port).await
+            let web_seeds: Option<Vec<String>>;
+
+            if let Some(ws) = meta.url_list {
+                web_seeds = Some(ws);
+            } else {
+                web_seeds = None;
+            }
+
+            download_files(trackers, web_seeds, meta.info_hash, peer_id, bt_listen_port).await
         }
     }
 }
